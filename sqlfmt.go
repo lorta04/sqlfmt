@@ -1,11 +1,13 @@
 package sqlfmt
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"unicode"
 
 	"github.com/cockroachdb/cockroachdb-parser/pkg/sql/parser"
+	"github.com/cockroachdb/cockroachdb-parser/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroachdb-parser/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroachdb-parser/pkg/util/json"
 	"github.com/cockroachdb/cockroachdb-parser/pkg/util/pretty"
@@ -45,8 +47,20 @@ func FmtSQL(cfg tree.PrettyCfg, stmts []string) (string, error) {
 			} else {
 				stmt = ""
 			}
+			if formatted, ok, err := formatSpecialStatement(cfg, next); ok {
+				if err != nil {
+					return "", err
+				}
+				prettied.WriteString(formatted)
+				prettied.WriteString(";\n")
+				hasContent = true
+				if hasContent {
+					prettied.WriteString("\n")
+				}
+				continue
+			}
 			// This should only return 0 or 1 responses.
-			allParsed, err := parser.Parse(next)
+			allParsed, err := parseStatement(next)
 			if err != nil {
 				return "", err
 			}
@@ -66,6 +80,135 @@ func FmtSQL(cfg tree.PrettyCfg, stmts []string) (string, error) {
 	}
 
 	return strings.TrimRightFunc(prettied.String(), unicode.IsSpace), nil
+}
+
+func parseStatement(stmt string) (stmts statements.Statements, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("parser panic for statement %q: %v", truncateForError(stmt), r)
+		}
+	}()
+	return parser.Parse(stmt)
+}
+
+func formatSpecialStatement(cfg tree.PrettyCfg, stmt string) (string, bool, error) {
+	trimmed := strings.TrimSpace(strings.TrimSuffix(stmt, ";"))
+	if !strings.HasPrefix(strings.ToUpper(trimmed), "DO") {
+		return "", false, nil
+	}
+
+	body, suffix, quote, ok, err := parseDoStatement(trimmed)
+	if !ok || err != nil {
+		return "", ok, err
+	}
+
+	formattedBody := formatDoBody(cfg, body)
+	switch quote {
+	case "'":
+		return "DO '" + strings.ReplaceAll(formattedBody, "'", "''") + "'" + suffix, true, nil
+	case "$$":
+		return "DO $$" + formattedBody + "$$" + suffix, true, nil
+	default:
+		return "", false, nil
+	}
+}
+
+func parseDoStatement(stmt string) (body string, suffix string, quote string, ok bool, err error) {
+	rest := strings.TrimSpace(stmt[2:])
+	if rest == "" {
+		return "", "", "", false, nil
+	}
+
+	switch {
+	case strings.HasPrefix(rest, "'"):
+		var b strings.Builder
+		for i := 1; i < len(rest); i++ {
+			if rest[i] != '\'' {
+				b.WriteByte(rest[i])
+				continue
+			}
+			if i+1 < len(rest) && rest[i+1] == '\'' {
+				b.WriteByte('\'')
+				i++
+				continue
+			}
+			return b.String(), strings.TrimSpace(rest[i+1:]), "'", true, nil
+		}
+		return "", "", "", true, fmt.Errorf("unterminated DO string literal")
+	case strings.HasPrefix(rest, "$$"):
+		end := strings.LastIndex(rest, "$$")
+		if end <= 1 {
+			return "", "", "", true, fmt.Errorf("unterminated DO dollar-quoted body")
+		}
+		return rest[2:end], strings.TrimSpace(rest[end+2:]), "$$", true, nil
+	default:
+		return "", "", "", false, nil
+	}
+}
+
+func formatDoBody(cfg tree.PrettyCfg, body string) string {
+	body = strings.ReplaceAll(body, "\r\n", "\n")
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return body
+	}
+
+	lines := strings.Split(body, "\n")
+	var formatted []string
+	indent := 0
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			formatted = append(formatted, "")
+			continue
+		}
+
+		if closesDoBlock(trimmed) && indent > 0 {
+			indent--
+		}
+		formatted = append(formatted, indentString(cfg, indent)+trimmed)
+		if opensDoBlock(trimmed) {
+			indent++
+		}
+	}
+	return strings.Join(formatted, "\n")
+}
+
+func closesDoBlock(line string) bool {
+	upper := strings.ToUpper(line)
+	return upper == "END" ||
+		upper == "END;" ||
+		strings.HasPrefix(upper, "END ") ||
+		strings.HasPrefix(upper, "END;") ||
+		strings.HasPrefix(upper, "ELSE") ||
+		strings.HasPrefix(upper, "ELSIF") ||
+		strings.HasPrefix(upper, "EXCEPTION")
+}
+
+func opensDoBlock(line string) bool {
+	upper := strings.ToUpper(line)
+	return upper == "BEGIN" ||
+		strings.HasSuffix(upper, " THEN") ||
+		strings.HasSuffix(upper, " LOOP") ||
+		strings.HasSuffix(upper, " CASE")
+}
+
+func indentString(cfg tree.PrettyCfg, depth int) string {
+	if depth <= 0 {
+		return ""
+	}
+	if cfg.UseTabs {
+		return strings.Repeat("\t", depth)
+	}
+	return strings.Repeat(" ", cfg.TabWidth*depth)
+}
+
+func truncateForError(stmt string) string {
+	stmt = strings.Join(strings.Fields(stmt), " ")
+	if len(stmt) <= 80 {
+		return stmt
+	}
+	return stmt[:77] + "..."
 }
 
 func FmtJSON(s string) (pretty.Doc, error) {
