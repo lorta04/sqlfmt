@@ -69,6 +69,7 @@ func FmtSQL(cfg tree.PrettyCfg, stmts []string) (string, error) {
 				if err != nil {
 					return "", err
 				}
+				pretty = reattachStandaloneComments(next, pretty)
 				prettied.WriteString(pretty)
 				prettied.WriteString(";\n")
 				hasContent = true
@@ -209,6 +210,106 @@ func truncateForError(stmt string) string {
 		return stmt
 	}
 	return stmt[:77] + "..."
+}
+
+type commentAttachment struct {
+	anchor   string
+	comments []string
+}
+
+func reattachStandaloneComments(original string, formatted string) string {
+	attachments := collectStandaloneComments(original)
+	if len(attachments) == 0 {
+		return formatted
+	}
+
+	lines := strings.Split(formatted, "\n")
+	anchorCounts := map[string]int{}
+	used := make([]bool, len(attachments))
+	var out []string
+
+	for _, line := range lines {
+		anchor := commentAnchor(line)
+		if anchor != "" {
+			anchorCounts[anchor]++
+			ordinal := anchorCounts[anchor]
+			for i, attachment := range attachments {
+				if used[i] || attachment.anchor != anchor || countAnchorBefore(attachments, i) != ordinal {
+					continue
+				}
+				indent := leadingWhitespace(line)
+				for _, comment := range attachment.comments {
+					out = append(out, indent+comment)
+				}
+				used[i] = true
+				break
+			}
+		}
+		out = append(out, line)
+	}
+
+	return strings.Join(out, "\n")
+}
+
+func collectStandaloneComments(sql string) []commentAttachment {
+	lines := strings.Split(strings.ReplaceAll(sql, "\r\n", "\n"), "\n")
+	var pending []string
+	var attachments []commentAttachment
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "":
+			pending = nil
+		case strings.HasPrefix(trimmed, "--"):
+			pending = append(pending, trimmed)
+		default:
+			if len(pending) > 0 {
+				if anchor := commentAnchor(trimmed); anchor != "" {
+					attachments = append(attachments, commentAttachment{
+						anchor:   anchor,
+						comments: append([]string(nil), pending...),
+					})
+				}
+				pending = nil
+			}
+		}
+	}
+
+	return attachments
+}
+
+func commentAnchor(line string) string {
+	trimmed := strings.TrimSpace(line)
+	trimmed = strings.TrimLeft(trimmed, "(,")
+	trimmed = strings.TrimSpace(trimmed)
+	if trimmed == "" || strings.HasPrefix(trimmed, "--") || trimmed == ")" {
+		return ""
+	}
+
+	fields := strings.Fields(trimmed)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.Trim(fields[0], `"`)
+}
+
+func countAnchorBefore(attachments []commentAttachment, idx int) int {
+	count := 0
+	for i := 0; i <= idx; i++ {
+		if attachments[i].anchor == attachments[idx].anchor {
+			count++
+		}
+	}
+	return count
+}
+
+func leadingWhitespace(s string) string {
+	var i int
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	return s[:i]
 }
 
 func FmtJSON(s string) (pretty.Doc, error) {
