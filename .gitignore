@@ -1,2 +1,4 @@
 backend/dist
 sqlfmt
+
+.DS_Store

@@ -3,6 +3,7 @@ package sqlfmt
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode"
 
@@ -15,6 +16,8 @@ import (
 
 var (
 	ignoreComments = regexp.MustCompile(`^--.*\s*`)
+	xmlTypeRE      = regexp.MustCompile(`(?i)\bXML\b`)
+	moneyTypeRE    = regexp.MustCompile(`(?i)\bMONEY\b`)
 )
 
 func FmtSQL(cfg tree.PrettyCfg, stmts []string) (string, error) {
@@ -59,8 +62,9 @@ func FmtSQL(cfg tree.PrettyCfg, stmts []string) (string, error) {
 				}
 				continue
 			}
+			parseInput := preprocessUnsupportedTypes(next)
 			// This should only return 0 or 1 responses.
-			allParsed, err := parseStatement(next)
+			allParsed, err := parseStatement(parseInput)
 			if err != nil {
 				return "", err
 			}
@@ -69,6 +73,7 @@ func FmtSQL(cfg tree.PrettyCfg, stmts []string) (string, error) {
 				if err != nil {
 					return "", err
 				}
+				pretty = preserveOriginalColumnTypes(next, pretty)
 				pretty = reattachStandaloneComments(next, pretty)
 				prettied.WriteString(pretty)
 				prettied.WriteString(";\n")
@@ -310,6 +315,139 @@ func leadingWhitespace(s string) string {
 		i++
 	}
 	return s[:i]
+}
+
+func preserveOriginalColumnTypes(original string, formatted string) string {
+	typeByColumn := collectOriginalColumnTypes(original)
+	if len(typeByColumn) == 0 {
+		return formatted
+	}
+
+	columns := make([]string, 0, len(typeByColumn))
+	for col := range typeByColumn {
+		columns = append(columns, col)
+	}
+	sort.Slice(columns, func(i, j int) bool {
+		return len(columns[i]) > len(columns[j])
+	})
+
+	out := formatted
+	for _, col := range columns {
+		pgType := typeByColumn[col]
+		for _, normalizedType := range normalizedTypeCandidates(pgType) {
+			re := regexp.MustCompile(`(?i)(\b` + regexp.QuoteMeta(col) + `\b\s+)` + regexp.QuoteMeta(normalizedType))
+			out = re.ReplaceAllString(out, `${1}`+pgType)
+		}
+	}
+	return out
+}
+
+func collectOriginalColumnTypes(sql string) map[string]string {
+	lines := strings.Split(strings.ReplaceAll(sql, "\r\n", "\n"), "\n")
+	typeByColumn := map[string]string{}
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "--") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, ")") {
+			break
+		}
+		fields := strings.Fields(strings.TrimSuffix(trimmed, ","))
+		if len(fields) < 2 {
+			continue
+		}
+		switch strings.ToUpper(fields[0]) {
+		case "CONSTRAINT", "PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "EXCLUDE":
+			continue
+		}
+		col := strings.Trim(fields[0], `"`)
+		if col == "" {
+			continue
+		}
+		if typ, ok := extractOriginalType(fields[1:]); ok {
+			typeByColumn[col] = typ
+		}
+	}
+	return typeByColumn
+}
+
+func extractOriginalType(fields []string) (string, bool) {
+	if len(fields) == 0 {
+		return "", false
+	}
+	head := strings.ToUpper(fields[0])
+	switch head {
+	case "TEXT", "BYTEA", "JSON", "FLOAT", "XML", "MONEY", "SERIAL", "BIGSERIAL", "SMALLSERIAL":
+		return head, true
+	case "INT", "INTEGER":
+		return "INT", true
+	case "BIGINT", "SMALLINT":
+		return head, true
+	}
+
+	if head == "NUMERIC" {
+		if len(fields) > 1 && strings.HasPrefix(fields[1], "(") {
+			return "NUMERIC" + strings.ToUpper(fields[1]), true
+		}
+		return "NUMERIC", true
+	}
+	if strings.HasPrefix(head, "NUMERIC(") {
+		return head, true
+	}
+	if strings.HasPrefix(head, "FLOAT(") {
+		return head, true
+	}
+
+	return "", false
+}
+
+func normalizedTypeCandidates(originalType string) []string {
+	switch {
+	case originalType == "TEXT":
+		return []string{"STRING"}
+	case originalType == "BYTEA":
+		return []string{"BYTES"}
+	case originalType == "JSON":
+		return []string{"JSONB"}
+	case originalType == "XML":
+		return []string{"STRING"}
+	case originalType == "MONEY":
+		return []string{"DECIMAL"}
+	case originalType == "SERIAL":
+		return []string{"SERIAL8"}
+	case originalType == "BIGSERIAL":
+		return []string{"SERIAL8"}
+	case originalType == "SMALLSERIAL":
+		return []string{"SERIAL2"}
+	case originalType == "FLOAT":
+		return []string{"FLOAT8"}
+	case originalType == "FLOAT(24)":
+		return []string{"FLOAT4"}
+	case originalType == "FLOAT(53)":
+		return []string{"FLOAT8"}
+	case originalType == "INT", originalType == "INTEGER", originalType == "BIGINT":
+		return []string{"INT8"}
+	case originalType == "SMALLINT":
+		return []string{"INT2"}
+	case originalType == "NUMERIC":
+		return []string{"DECIMAL"}
+	case strings.HasPrefix(originalType, "NUMERIC("):
+		return []string{"DECIMAL" + strings.TrimPrefix(originalType, "NUMERIC")}
+	default:
+		return []string{originalType}
+	}
+}
+
+func preprocessUnsupportedTypes(sql string) string {
+	upper := strings.ToUpper(sql)
+	if !strings.Contains(upper, "CREATE TABLE") {
+		return sql
+	}
+	// Cockroach parser in this module doesn't support XML/MONEY type tokens in table defs.
+	sql = xmlTypeRE.ReplaceAllString(sql, "TEXT")
+	sql = moneyTypeRE.ReplaceAllString(sql, "DECIMAL")
+	return sql
 }
 
 func FmtJSON(s string) (pretty.Doc, error) {
