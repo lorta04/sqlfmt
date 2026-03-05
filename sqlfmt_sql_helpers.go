@@ -182,7 +182,25 @@ func reattachStandaloneComments(original string, formatted string) string {
 		out = append(out, line)
 	}
 
-	return strings.Join(out, "\n")
+	result := strings.Join(out, "\n")
+	for i, attachment := range attachments {
+		if used[i] {
+			continue
+		}
+		re := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(attachment.anchor) + `\b`)
+		idx := re.FindStringIndex(result)
+		if idx == nil {
+			continue
+		}
+		var block strings.Builder
+		for _, c := range attachment.comments {
+			block.WriteString("\n    ")
+			block.WriteString(c)
+		}
+		block.WriteString("\n    ")
+		result = result[:idx[0]] + block.String() + result[idx[0]:]
+	}
+	return result
 }
 
 func collectStandaloneComments(sql string) []commentAttachment {
@@ -207,10 +225,41 @@ func collectStandaloneComments(sql string) []commentAttachment {
 				}
 				pending = nil
 			}
+			// Also keep trailing inline comments (e.g. "col TYPE -- note").
+			if idx := inlineCommentIndex(line); idx >= 0 {
+				sqlPart := strings.TrimSpace(line[:idx])
+				if anchor := commentAnchor(sqlPart); anchor != "" {
+					attachments = append(attachments, commentAttachment{
+						anchor:   anchor,
+						comments: []string{strings.TrimSpace(line[idx:])},
+					})
+				}
+			}
 		}
 	}
 
 	return attachments
+}
+
+func inlineCommentIndex(line string) int {
+	inSingle := false
+	inDouble := false
+	for i := 0; i+1 < len(line); i++ {
+		ch := line[i]
+		next := line[i+1]
+		if !inDouble && ch == '\'' {
+			inSingle = !inSingle
+			continue
+		}
+		if !inSingle && ch == '"' {
+			inDouble = !inDouble
+			continue
+		}
+		if !inSingle && !inDouble && ch == '-' && next == '-' {
+			return i
+		}
+	}
+	return -1
 }
 
 func commentAnchor(line string) string {

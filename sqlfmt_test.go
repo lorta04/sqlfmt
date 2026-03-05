@@ -85,6 +85,33 @@ func TestFmtSQLReattachesStandaloneComments(t *testing.T) {
 	}
 }
 
+func TestFmtSQLReattachesInlineComments(t *testing.T) {
+	cfg := tree.DefaultPrettyCfg()
+	cfg.UseTabs = false
+	cfg.TabWidth = 4
+	cfg.LineWidth = 120
+
+	got, err := FmtSQL(cfg, []string{`CREATE TABLE IF NOT EXISTS sample_entities (
+  entity_id UUID NOT NULL PRIMARY KEY, -- External primary identifier
+  owner_id TEXT NOT NULL, -- Upstream owner reference
+  payload BYTEA NOT NULL -- Binary payload blob
+);`})
+	if err != nil {
+		t.Fatalf("FmtSQL returned error: %v", err)
+	}
+
+	wantContains := []string{
+		"    -- External primary identifier\n    entity_id",
+		"    -- Upstream owner reference\n    owner_id",
+		"    -- Binary payload blob\n    payload",
+	}
+	for _, want := range wantContains {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected formatted SQL to contain:\n%s\n\ngot:\n%s", want, got)
+		}
+	}
+}
+
 func TestFmtSQLPreservesPostgresColumnTypes(t *testing.T) {
 	cfg := tree.DefaultPrettyCfg()
 	cfg.UseTabs = false
